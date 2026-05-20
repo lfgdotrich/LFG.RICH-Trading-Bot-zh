@@ -1,0 +1,76 @@
+chain:
+  name: bsc                         # 链的可读名称。BNB Smart Chain 请保持为 bsc。
+  chain_id: 56                      # BNB Smart Chain 主网 chain ID。
+
+rpc:
+  request_timeout_sec: 20           # 单个 RPC 请求的超时时间，单位为秒。
+  max_retries: 3                    # RPC 调用失败时的重试次数。
+  backoff_sec: 0.5                  # 初始重试延迟，单位为秒；重复失败时会递增。
+
+# BSC 上的 LFG.RICH 协议合约。
+lfg:
+  factory: "0xaf6d6F359a630Ec6eb2BaFDc338b86d3E84CaF66"       # LFG.RICH Factory 合约。
+  hook: "0xCA8D8D8d3d97cfac290a3850d32c2E8330CCe888"          # LFG.RICH Uniswap V4 Hook 合约，用于事件、价格和预估。
+  swap_router: "0x092043364f39f7f57C4E1D32116f453BfaE37440"   # LFG.RICH SwapRouter 合约，用于执行买入/卖出。
+  pool_manager: "0x28e2Ea090877bF75740558f6BFB36A5ffeE9e9dF"  # 协议使用的 Uniswap V4 PoolManager。
+
+bot:
+  polling_interval_sec: 120         # 每轮机器人循环之间的秒数。
+  trade_cooldown_sec: 300           # 同一代币交易后再次交易前等待的秒数。
+  min_hold_minutes: 45              # 普通卖出逻辑允许卖出前，买入 lot 至少持有的分钟数。
+
+  profit_gate_enabled: true         # 为 true 时，普通卖出需要达到 min_profit_pct，除非触发止损。
+  min_profit_pct: 8.0               # 开启 profit gate 时普通卖出需要达到的最低利润百分比。
+  max_loss_pct: 10.0                # 止损百分比。例如 10 表示 lot 亏损达到 -10% 或更差时卖出。
+  max_hold_minutes: 0               # 可选强制退出时间，单位分钟。0 表示关闭。
+
+  slippage_bps: 1200                # 滑点容忍度，单位 bps。1200 = 12%。需要覆盖 LFG 代币费用和波动。
+  gas_limit: 650000                 # LFG 买入/卖出交易使用的 gas limit。
+  min_bnb_for_gas: 0.005            # 预留用于 gas 的 BNB。机器人不会把余额花到低于这个值。
+  min_trade_bnb: 0.005              # 买入/卖出动作的最小 BNB 金额。
+  max_trade_bnb: 0.7                # 单笔买入/卖出的最大 BNB 金额。
+
+  blocks_per_candle: 20             # 每根内部价格 K 线包含的 BSC 区块数量。
+
+  confirmations: 5                  # 处理事件前等待的确认区块数量。
+  log_chunk_blocks: 1000            # eth_getLogs 每次查询的区块范围。公共/免费 RPC 限流或失败时降低此值。
+  warmup_lookback_blocks: 700000    # 首次运行时向前扫描的区块数量，用于给旧代币建立历史 K 线。
+  max_history_candles: 500          # 每个代币在内存/缓存中保留的最大 K 线数量。
+
+  fast_down_enabled: true           # 启用快速下跌卖出保护。
+  fast_down_candles: 5              # 快速下跌检测使用的最近真实成交 K 线数量。
+  fast_down_min_drop_pct: 0.25      # 在 fast_down_candles 范围内触发快速下跌的最小跌幅百分比。
+  fast_down_min_steps: 3            # 触发快速下跌所需的最少红/下跌 K 线步骤数量。
+
+  warmup_approve: true              # 为 true 时，启动时检查/授权 LFG SwapRouter 的代币 allowance。
+  approve_wait_sec: 45              # 卖出执行前等待授权交易确认的秒数。
+  dry_run: false                    # 为 true 时只打印计划交易，不发送真实交易。
+
+  test_mode: false                  # 为 true 时强制执行 test_action，而不是使用策略信号。
+  test_action: "SELL"               # BUY 或 SELL。只在 test_mode 为 true 时使用。不要翻译这些值。
+  test_amount_bnb: 0.005            # test_mode 动作使用的交易金额，单位 BNB。
+  test_once: true                   # 为 true 时只执行一次测试动作并退出。
+
+  trend_confirm_candles: 3          # 用于确认趋势方向的 K 线数量。
+  ema_deadband_pct: 0.06            # EMA 死区百分比，帮助避免 EMA 非常接近时频繁翻转。
+  dump_lookback: 2                  # 检测快速砸盘使用的 K 线数量。
+  dump_drop_pct: 0.50               # 在 dump_lookback 范围内触发砸盘判断的跌幅百分比。
+  pump_lookback: 2                  # 检测快速拉升使用的 K 线数量。
+  pump_rise_pct: 0.50               # 在 pump_lookback 范围内触发拉升判断的涨幅百分比。
+  bleed_lookback: 5                 # 检测慢跌/阴跌使用的 K 线数量。
+  bleed_drop_pct: 0.50              # 在 bleed_lookback 范围内用于阴跌判断的跌幅百分比。
+  bleed_rise_pct: 0.50              # 用于区分恢复走势和阴跌的上涨阈值。
+  bleed_min_steps: 5                # 触发阴跌判断所需的最少下跌步骤数量。
+
+watchlist:
+  tokens:
+    - symbol: "LFGBULL"             # 日志、Dashboard 和本地数据库中使用的短标签。
+      address: "0x29Ede1E1254419Fe5a3c803fC2b015042075A49A"  # LFG.RICH 代币合约地址。
+      max_alloc_bnb: 0.05           # 该代币允许使用的最大总 BNB 配置额度。
+      add_step_bnb: 0.005           # 策略决定买入/加仓时使用的 BNB 数量。
+      timeframe_sec: 120            # 策略目标时间框架，单位秒。为兼容策略设置/日志而保留。
+      ema_fast: 3                   # 策略使用的快速 EMA 周期。
+      ema_slow: 9                   # 策略使用的慢速 EMA 周期。
+      rsi_period: 7                 # 策略使用的 RSI 周期。
+      dust_size: 0.0001             # 低于该数量的代币会被视为 dust，并在本地 lot 统计中当作已关闭。
+      dex: "lfg"                    # 交易场所。LFG.RICH 代币请保持为 lfg。

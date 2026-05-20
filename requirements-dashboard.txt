@@ -1,0 +1,5 @@
+# Optional dashboard dependencies for Python 3.8.
+# Install only if you plan to run: python -m streamlit run bot/dashboard.py
+-r requirements.txt
+pandas==2.0.3
+streamlit==1.40.1

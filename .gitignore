@@ -1,0 +1,7 @@
+.venv/
+.env
+state.db
+state.db*
+__pycache__/
+*.pyc
+config.yaml
