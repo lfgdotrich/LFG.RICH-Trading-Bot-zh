@@ -7,7 +7,7 @@ from typing import Optional, List, Tuple
 
 
 class TradeDB:
-    # 将极小浮点残留视为 0（避免 dust lots 一直保持 “open”）
+    # 将极小浮点剩余量视为零（避免 dust lots 一直保持“open”）
     _LOT_EPS_QTY = 1e-4
 
     @dataclass
@@ -26,7 +26,7 @@ class TradeDB:
         side: str
         status: str
         note: str
-        # 快照字段（数据库中以 TEXT 保存，这里返回 int）
+        # 快照字段（在数据库中存为 TEXT，此处返回 int）
         bnb_before_wei: Optional[int]
         tok_before_raw: Optional[int]
         token_dec: Optional[int]
@@ -43,25 +43,25 @@ class TradeDB:
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self._ensure_schema()
 
-        # 每个 symbol 的 dust 阈值（qty_open 低于该值时视为已关闭）
+        # 每个 symbol 的 dust 阈值（qty_open 低于此值视为已关闭）
         self.dust_by_symbol: dict[str, float] = {}
 
     def set_dust_map(self, dust_by_symbol: dict[str, float]) -> None:
-        # 规范化 key/value
+        # 标准化 keys/values
         self.dust_by_symbol = {str(k): float(v) for k, v in (dust_by_symbol or {}).items()}
 
     def get_dust(self, symbol: str) -> float:
         return float(self.dust_by_symbol.get(str(symbol), 0.0))
 
     def pick_lot_id_by_qty(self, symbol: str, qty_to_sell: float) -> Optional[int]:
-        """当 SELL 缺少目标 lot_id 时，选择一个要消耗的 lot id。
+        """Pick a lot id to consume for a SELL when the intended lot_id is missing.
 
-        重要：这个函数不会使用 FIFO。它会尝试把卖出数量与当前 open lots 匹配
-        （list_open_lots 已经进行了 dust 过滤）。
+        IMPORTANT: This function NEVER uses FIFO. It tries to match the sold quantity
+        against currently-open lots (already dust-filtered by list_open_lots).
 
-        策略：
-        1) 优先选择 qty_open >= qty_to_sell 且剩余量最小的 lot。
-        2) 如果没有完全匹配（例如部分卖出或舍入误差），选择 qty_open 最接近 qty_to_sell 的 lot。
+        Strategy:
+        1) Prefer lots where qty_open >= qty_to_sell and minimize leftover (qty_open-qty_to_sell).
+        2) If none fit (e.g. partial sells or rounding), pick the lot with qty_open closest to qty_to_sell.
         """
         try:
             q = float(qty_to_sell)
@@ -74,7 +74,7 @@ class TradeDB:
         if not lots:
             return None
 
-        # 1) 完全覆盖且剩余量最小
+        # 1) 匹配后剩余量最小
         fits = []
         for lot in lots:
             try:
@@ -87,7 +87,7 @@ class TradeDB:
             fits.sort(key=lambda x: x[0])
             return int(fits[0][1])
 
-        # 2) 按绝对差值选择最接近的 lot
+        # 2) 绝对差值最接近
         closest = []
         for lot in lots:
             try:
@@ -106,7 +106,7 @@ class TradeDB:
         return {row[1] for row in cur.fetchall()}
 
     def _ensure_schema(self) -> None:
-        # trades：注意快照字段使用 TEXT，避免整数溢出
+        # 交易：注意快照字段为 TEXT，避免溢出
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS trades (
@@ -140,7 +140,7 @@ class TradeDB:
             """
         )
 
-        # FIFO lots：每次 BUY 一行，跟踪剩余数量/成本
+        # FIFO lots：每笔 BUY 一行，跟踪剩余数量/成本
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS lots (
@@ -159,7 +159,7 @@ class TradeDB:
             """
         )
 
-        # 每次 SELL 可以消耗多个 lots（fills）
+        # 每笔 SELL 可以消耗多个 lots（fills）
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS lot_fills (
@@ -190,7 +190,7 @@ class TradeDB:
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_tx ON trades(tx_hash);")
         self.conn.commit()
 
-        # 如果数据库是旧 schema，尽力补充缺失列
+        # 如果数据库使用旧 schema，则尽力添加缺失列
         cols = self._columns("trades")
 
         def add_col(col: str, ddl_type: str) -> None:
@@ -211,7 +211,7 @@ class TradeDB:
             self.conn.commit()
 
     # -----------------------
-    # trades
+    # 交易
     # -----------------------
 
     def insert_sent(
@@ -225,7 +225,7 @@ class TradeDB:
         tok_before_raw: Optional[int] = None,
         token_dec: Optional[int] = None,
     ) -> None:
-        # 将快照整数以字符串保存，避免 INTEGER 溢出
+        # 将快照整数以字符串存储，避免 INTEGER 溢出
         bnb_txt = str(int(bnb_before_wei)) if bnb_before_wei is not None else None
         tok_txt = str(int(tok_before_raw)) if tok_before_raw is not None else None
         dec_int = int(token_dec) if token_dec is not None else None
@@ -278,8 +278,8 @@ class TradeDB:
 
     def list_mined_trades(self):
         """
-        按时间顺序返回已上链交易及其已计算的 delta。
-        用于重启后重建仓位和成本基础。
+        按时间顺序返回已上链交易，并带有计算出的 delta。
+        用于重启后重建持仓/成本基础。
         """
         cur = self.conn.cursor()
         rows = cur.execute(
@@ -292,7 +292,7 @@ class TradeDB:
             """
         ).fetchall()
 
-        # 以简单对象/dict 返回，保持最小化
+        # 以简单对象/字典返回，保持最小化
         out = []
         for r in rows:
             out.append({
@@ -351,7 +351,7 @@ class TradeDB:
         )
 
     # -----------------------
-    # positions
+    # 持仓
     # -----------------------
 
     def upsert_position(self, symbol: str, token: str, qty_token: float, cost_bnb: float) -> None:
@@ -385,26 +385,26 @@ class TradeDB:
 
 
     # -----------------------
-    # FIFO lots（每次 BUY 对应一个 lot）
+    # FIFO lots（按每笔 BUY 记录）
     # -----------------------
 
     def reset_lots(self) -> None:
         """
         硬重置 lots 和 lot_fills。
-        这必须是原子操作，因为 rebuild_positions_from_trades() 会重新插入 fills。
-        如果不清空 lot_fills，每次重启都会重复 fills，并可能破坏 open lots。
+        这必须是原子的，因为 rebuild_positions_from_trades() 会重新插入 fills。
+        如果不清理 lot_fills，每次重启都会重复 fills，并可能破坏开放 lots。
         """
         with self.conn:
-            # 1) 先清空 fills（它们引用 lot ids）
+            # 1) 先清除 fills（它们引用 lot ids）
             self.conn.execute("DELETE FROM lot_fills")
 
-            # 2) 清空 lots
+            # 2) 清除 lots
             self.conn.execute("DELETE FROM lots")
 
-            # 3) 重置自增计数器，避免 id 永久增长，
-            #    同时避免重建时意外发生 lot_id 冲突。
-            #    sqlite_sequence 只在表使用 AUTOINCREMENT 创建时存在；
-            #    尝试删除是安全的，忽略错误即可。
+            # 3) 重置自增计数器，避免 ids 永远漂移，
+            #    并避免重建时意外发生 lot_id 冲突。
+            #    （sqlite_sequence 仅在表使用 AUTOINCREMENT 创建时存在；
+            #     尝试删除它是安全的，忽略错误即可。）
             try:
                 self.conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('lots','lot_fills')")
             except Exception:
@@ -466,12 +466,12 @@ class TradeDB:
         ts: Optional[int] = None,
     ) -> Tuple[float, float]:
         """
-        按 FIFO 消耗 open lots。
-        返回：(realized_pnl_bnb, cost_sold_bnb)
+        Consume open lots FIFO.
+        Returns: (realized_pnl_bnb, cost_sold_bnb)
 
-        如果 qty_to_sell 超过可用 lots，剩余部分会被视为 “免费代币”（成本=0）。
-        对这部分剩余数量，我们分配卖出收入但成本为 0（否则百分比会变成无限大），
-        因此当存在剩余部分时，决策逻辑应回退到整体 PnL。
+        If qty_to_sell exceeds available lots, the remainder is treated as "free tokens" (cost=0).
+        For that free remainder, we allocate proceeds but cost is 0 (which would make infinite %),
+        so decision logic should fallback to overall pnl when remainder exists.
         """
         ts_i = int(ts or time.time())
         qty_to_sell = float(max(0.0, qty_to_sell))
@@ -480,7 +480,7 @@ class TradeDB:
         if qty_to_sell <= 0:
             return 0.0, 0.0
 
-        # 按卖出的代币数量比例拆分收入（简单且一致）
+        # 按卖出代币数量比例拆分 proceeds（简单且一致）
         price = proceeds_total_bnb / qty_to_sell if qty_to_sell > 0 else 0.0
 
         lots = self.list_open_lots(symbol)
@@ -501,8 +501,8 @@ class TradeDB:
 
             take = min(lot_qty, remaining)
 
-            # 该 lot 中被卖出部分的成本基础
-            # 按 lot 剩余 open 成本/数量比例计算
+            # 该 lot 被消耗数量对应的成本基础
+            # 根据该 lot 剩余开放成本/数量按比例计算
             lot_avg = (lot_cost / lot_qty) if lot_qty > 0 else 0.0
             cost_part = lot_avg * take
             proceeds_part = price * take
@@ -512,7 +512,7 @@ class TradeDB:
             new_qty = lot_qty - take
             new_cost = max(0.0, lot_cost - cost_part)
 
-            # 将浮点 dust 压为 0，确保 lots 真正关闭。
+            # 将浮点 dust 限制为零，让 lots 真正关闭。
             if new_qty < self._LOT_EPS_QTY:
                 new_qty = 0.0
                 new_cost = 0.0
@@ -545,7 +545,7 @@ class TradeDB:
             total_proceeds += proceeds_part
             remaining -= take
 
-        # 剩余部分是 “免费代币”（成本=0）
+        # 剩余部分是“免费代币”（成本=0）
         if remaining > 0:
             free_proceeds = price * remaining
             total_proceeds += free_proceeds
@@ -566,13 +566,13 @@ class TradeDB:
             ts: Optional[int] = None,
     ) -> tuple[float, float]:
         """
-        根据 id 消耗指定 lot（不是 FIFO）。
+        按 id 消耗指定 lot（不是 FIFO）。
         返回 (realized_pnl_bnb, cost_sold_bnb)。
 
         重要：
         - 使用 self.conn（同一个数据库连接）。
         - 更新正确的列（qty_open, cost_open_bnb）。
-        - 插入 lot_fills，确保 Dashboard 和重建逻辑保持一致。
+        - 插入 lot_fills，让仪表盘/重建保持一致。
         """
 
         if qty_to_sell <= 0 or proceeds_total_bnb < 0:
@@ -608,7 +608,7 @@ class TradeDB:
 
         realized = float(proceeds_total_bnb) - float(cost_sold)
 
-        # 更新剩余量（压掉 dust）
+        # 更新剩余量（限制 dust）
         new_qty = qty_open - qty
         new_cost = max(0.0, cost_open - cost_sold)
         if new_qty < self._LOT_EPS_QTY:
@@ -651,10 +651,10 @@ class TradeDB:
         fallback_profit_pct: float,
     ) -> Optional[float]:
         """
-        使用 FIFO lot 成本，估算现在卖出 qty_to_sell 的利润百分比。
+        使用 FIFO lot 成本估算现在卖出 qty_to_sell 的利润百分比。
 
-        如果 qty_to_sell 超过可用 lots（存在免费剩余部分），返回 fallback_profit_pct，
-        以避免无限大或被夸大的 pnl%。
+        如果 qty_to_sell 超过可用 lots（存在免费剩余量），返回 fallback_profit_pct，
+        避免无限/夸大的 pnl%。
         """
         qty_to_sell = float(max(0.0, qty_to_sell))
         price_wbnb_per_token = float(max(0.0, price_wbnb_per_token))
@@ -668,7 +668,7 @@ class TradeDB:
         dust = self.get_dust(symbol)
         eps = max(1e-12, dust)
         if qty_to_sell > avail + eps:
-            # 包含免费剩余部分 -> 使用整体 pnl
+            # 包含免费剩余量 -> 按你建议使用整体 pnl
             return float(fallback_profit_pct)
 
         # 计算 qty_to_sell 的成本

@@ -11,7 +11,7 @@ def main() -> None:
 
     rpc_url = os.environ.get("BSC_RPC_URL", "").strip()
     if not rpc_url:
-        raise RuntimeError(".env 中缺少 BSC_RPC_URL")
+        raise RuntimeError("缺少 .env 中的 BSC_RPC_URL")
 
     w3 = make_web3(rpc_url, request_timeout_sec=20)
 

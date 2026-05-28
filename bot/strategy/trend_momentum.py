@@ -29,7 +29,7 @@ def _rsi(values: List[float], period: int) -> float:
         return 50.0
     gains = 0.0
     losses = 0.0
-    # 使用最近 period 的变化
+    # 使用最近一个周期的变化
     window = values[-(period + 1):]
     for i in range(1, len(window)):
         ch = float(window[i]) - float(window[i - 1])
@@ -58,19 +58,19 @@ def compute_signal(
     **_ignored,
 ) -> Signal:
     """
-    IMPORTANT:
-    - Trend/RSI are computed on REAL candles only (volume_token > 0).
-    - Adds dump/shock override: if price drops >= dump_drop_pct within last dump_lookback real candles,
-      force DOWN even if EMA hasn't crossed yet.
+    重要：
+    - Trend/RSI 只基于真实 K 线计算（volume_token > 0）。
+    - 增加砸盘/冲击覆盖：如果价格在最近 dump_lookback 根真实 K 线内下跌 >= dump_drop_pct，
+      即使 EMA 尚未交叉，也强制 DOWN。
     """
 
     if not hist:
-        return Signal(0.0, "FLAT", 50.0, "no candles")
+        return Signal(0.0, "FLAT", 50.0, "没有 K 线")
 
-    # 1) 指标只使用真实成交 K 线
+    # 1) 指标只使用真实 K 线
     real = [c for c in hist if float(getattr(c, "volume_token", 0.0) or 0.0) > 0.0]
     if len(real) < max(int(ema_slow), int(rsi_period), 10):
-        # 真实成交 K 线不足：回退到最近 N 个收盘价，同时避免长时间平铺数据。
+        # 真实 K 线不足：回退到最近 N 个收盘价，但仍避免长时间平铺填充。
         # 使用最近 200 根 K 线，但压缩相同收盘价。
         closes = []
         for c in hist[-200:]:
@@ -83,23 +83,23 @@ def compute_signal(
         closes = [float(c.close) for c in real if float(getattr(c, "close", 0.0) or 0.0) > 0.0]
 
     if len(closes) < max(int(ema_slow), int(rsi_period), 10):
-        return Signal(0.0, "FLAT", 50.0, f"not enough data closes={len(closes)}")
+        return Signal(0.0, "FLAT", 50.0, f"数据不足 closes={len(closes)}")
 
-    # 2) 使用真实 K 线进行冲击行情覆盖（快速砸盘 / 快速拉升）
-    # 必须同时满足：
-    # - 总涨跌幅 >= 阈值
-    # - 有足够的方向步骤确认，避免单根尖刺噪音
-    shock_lookback = max(2, int(dump_lookback))  # 为兼容保留原参数名
-    shock_down_pct = abs(float(dump_drop_pct))  # 为兼容保留现有配置名
-    shock_up_pct = abs(float(_ignored.get("pump_rise_pct", 0.50)))  # 如果传入则使用
-    shock_min_steps = int(_ignored.get("pump_lookback", 2))  # 如果传入则使用
+    # 2) 使用真实 K 线的冲击覆盖（快速砸盘 / 快速拉盘）
+    # 同时要求：
+    # - 总波动 >= 阈值
+    # - 有足够的方向步数确认，避免单根尖刺噪声
+    shock_lookback = max(2, int(dump_lookback))  # 复用已有参数名以保持兼容
+    shock_down_pct = abs(float(dump_drop_pct))  # 复用现有配置名
+    shock_up_pct = abs(float(_ignored.get("pump_rise_pct", 0.50)))  # 如果传入则为可选参数
+    shock_min_steps = int(_ignored.get("pump_lookback", 2))  # 如果传入则为可选参数
 
     if len(closes) >= shock_lookback + 1:
         window = closes[-(shock_lookback + 1):]
         first = window[0]
         last = window[-1]
 
-        # 统计窗口内的方向步骤
+        # 统计窗口内的方向步数
         up_steps = 0
         down_steps = 0
         for i in range(1, len(window)):
@@ -117,24 +117,24 @@ def compute_signal(
                     -0.60,
                     "DOWN",
                     _rsi(closes, int(rsi_period)),
-                    f"dump override: {move_pct:.3f}% over last {shock_lookback} real candles (down_steps={down_steps})",
+                    f"砸盘覆盖：{move_pct:.3f}% 于最近 {shock_lookback} 根真实 K 线（down_steps={down_steps})",
                 )
 
-            # 快速拉升
+            # 快速拉盘
             if move_pct >= shock_up_pct and up_steps >= shock_min_steps:
                 return Signal(
                     0.60,
                     "UP",
                     _rsi(closes, int(rsi_period)),
-                    f"pump override: {move_pct:.3f}% over last {shock_lookback} real candles (up_steps={up_steps})",
+                    f"拉盘覆盖：{move_pct:.3f}% 于最近 {shock_lookback} 根真实 K 线（up_steps={up_steps})",
                 )
 
-    # 2.5) 慢跌覆盖逻辑（捕捉 EMA 差值停留在死区内的长期磨损走势）
-    # 使用真实收盘价（已在 `closes` 中）。当较长窗口内净变化足够大，
-    # 且方向步骤数量足够时触发（避免震荡误判）。
+    # 2.5) 慢跌覆盖（捕捉 EMA 差值停留在死区内的长期磨跌趋势）
+    # 使用真实收盘价（已在 `closes` 中）。如果较长窗口内净变化足够大则触发
+    # 并且有足够步数与方向一致（避免震荡噪声）。
     bleed_lookback = int(_ignored.get("bleed_lookback", 30))          # 回看的真实 K 线数量
-    bleed_drop_pct = float(_ignored.get("bleed_drop_pct", 0.40))      # 窗口内强制 DOWN 的跌幅百分比
-    bleed_rise_pct = float(_ignored.get("bleed_rise_pct", 0.40))      # 窗口内强制 UP 的涨幅百分比
+    bleed_drop_pct = float(_ignored.get("bleed_drop_pct", 0.40))      # 窗口内强制 DOWN 的百分比跌幅
+    bleed_rise_pct = float(_ignored.get("bleed_rise_pct", 0.40))      # 窗口内强制 UP 的百分比涨幅
     bleed_min_steps = int(_ignored.get("bleed_min_steps", max(2, int(bleed_lookback * 0.60))))
 
     if len(closes) >= bleed_lookback + 1:
@@ -158,7 +158,7 @@ def compute_signal(
                     -0.60,
                     "DOWN",
                     _rsi(closes, int(rsi_period)),
-                    f"bleed override: {move_pct:.3f}% over last {bleed_lookback} real candles (down_steps={down_steps}/{bleed_lookback})",
+                    f"慢跌覆盖：{move_pct:.3f}% 于最近 {bleed_lookback} 根真实 K 线（down_steps={down_steps}/{bleed_lookback})",
                 )
 
             if move_pct >= abs(bleed_rise_pct) and up_steps >= bleed_min_steps:
@@ -166,24 +166,24 @@ def compute_signal(
                     0.60,
                     "UP",
                     _rsi(closes, int(rsi_period)),
-                    f"bleed override: {move_pct:.3f}% over last {bleed_lookback} real candles (up_steps={up_steps}/{bleed_lookback})",
+                    f"慢跌覆盖：{move_pct:.3f}% 于最近 {bleed_lookback} 根真实 K 线（up_steps={up_steps}/{bleed_lookback})",
                 )
 
 
-    # 3) 在真实收盘价上使用带死区和确认的 EMA 交叉
+    # 3) 基于真实收盘价的 EMA 交叉 + 死区 + 确认
     ef = _ema(closes[-max(len(closes), int(ema_slow) * 3):], int(ema_fast))
     es = _ema(closes[-max(len(closes), int(ema_slow) * 3):], int(ema_slow))
 
     if es <= 0:
-        return Signal(0.0, "FLAT", _rsi(closes, int(rsi_period)), "bad EMA baseline")
+        return Signal(0.0, "FLAT", _rsi(closes, int(rsi_period)), "EMA 基准无效")
 
     diff_pct = ((ef - es) / es) * 100.0
     deadband = abs(float(ema_deadband_pct))
 
-    # 使用最近 K 个 EMA 差值确认（通过最近 K 个收盘价近似重新计算 EMA 差值）
+    # 使用最近 K 个 EMA 差值确认（通过最近 K 个收盘价重新计算 EMA 差值近似）
     k = max(1, int(confirm_candles))
     diffs = []
-    tail = closes[-(max(k + 20, int(ema_slow) + k + 5)):]  # 较小尾部窗口
+    tail = closes[-(max(k + 20, int(ema_slow) + k + 5)):]  # 小尾部窗口
     for i in range(k):
         sub = tail[: len(tail) - (k - 1 - i)]
         if len(sub) < int(ema_slow) + 2:
@@ -204,13 +204,13 @@ def compute_signal(
             0.0,
             "FLAT",
             rsi,
-            f"deadband: |EMA diff| {abs(diff_pct):.4f}% < {deadband:.4f}% (EMA{ema_fast}={ef:.5g}, EMA{ema_slow}={es:.5g}, RSI={rsi:.2f})",
+            f"死区：|EMA diff| {abs(diff_pct):.4f}% < {deadband:.4f}% (EMA{ema_fast}={ef:.5g}, EMA{ema_slow}={es:.5g}, RSI={rsi:.2f})",
         )
 
     if confirmed_up and diff_pct > 0:
-        return Signal(0.60, "UP", rsi, f"real: EMA{ema_fast}={ef:.5g} > EMA{ema_slow}={es:.5g}, RSI={rsi:.2f}")
+        return Signal(0.60, "UP", rsi, f"真实：EMA{ema_fast}={ef:.5g} > EMA{ema_slow}={es:.5g}, RSI={rsi:.2f}")
     if confirmed_down and diff_pct < 0:
-        return Signal(-0.60, "DOWN", rsi, f"real: EMA{ema_fast}={ef:.5g} < EMA{ema_slow}={es:.5g}, RSI={rsi:.2f}")
+        return Signal(-0.60, "DOWN", rsi, f"真实：EMA{ema_fast}={ef:.5g} < EMA{ema_slow}={es:.5g}, RSI={rsi:.2f}")
 
     # 未确认 -> FLAT
-    return Signal(0.0, "FLAT", rsi, f"unconfirmed: EMA diff {diff_pct:.4f}% (need {k} candles confirm)")
+    return Signal(0.0, "FLAT", rsi, f"未确认：EMA diff {diff_pct:.4f}%（需要 {k} 根 K 线确认)")

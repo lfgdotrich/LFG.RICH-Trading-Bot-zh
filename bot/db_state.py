@@ -19,7 +19,7 @@ class KV:
         self.conn.execute(SCHEMA)
         self.conn.commit()
 
-    # ---- 通用字符串 get/set（JSON 存储需要）----
+    # ---- 通用字符串 get/set（json 需要）----
     def get_str(self, key: str) -> Optional[str]:
         cur = self.conn.execute("SELECT v FROM kv WHERE k=?", (key,))
         row = cur.fetchone()

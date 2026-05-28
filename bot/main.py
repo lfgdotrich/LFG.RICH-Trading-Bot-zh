@@ -35,6 +35,21 @@ def norm_tx_hash(txh: str | None) -> str:
     return txh if txh.startswith("0x") else "0x" + txh
 
 
+def is_pruned_history_error(exc: Exception) -> bool:
+    """检测拒绝历史 eth_getLogs 范围的 RPC 提供商。
+
+    一些 BSC RPC 提供商会保留最新区块状态，但裁剪较旧的日志历史。
+    发生这种情况时，即使配置的 warmup_lookback_blocks 很小，
+    如果 state.db 仍然包含上次运行保存的较旧 last_block，扫描旧区块也会失败。
+    """
+    msg = str(exc).lower()
+    return (
+        "history has been pruned" in msg
+        or "pruned for this block" in msg
+        or ("pruned" in msg and "block" in msg)
+    )
+
+
 def pick_first_sellable_lot(
     lots: list[dict],
     *,
@@ -42,7 +57,7 @@ def pick_first_sellable_lot(
     wallet_qty: float,
     price_wbnb_per_token: float | None = None,
 ) -> tuple[dict | None, float, float | None]:
-    """选择预计 PnL 最好的 open lot；如果无法估算，则回退到第一个可卖出的 lot。"""
+    """选择预估 PnL 最好的开放 lot；如果无法估算，则回退到第一个可卖 lot。"""
     if not lots or wallet_qty <= 0:
         return None, 0.0, None
 
@@ -111,7 +126,7 @@ def main() -> None:
         raise RuntimeError(f"RPC chain_id 不匹配：期望 {cfg.chain_id}，实际 {w3.eth.chain_id}")
 
     if not cfg.watch_tokens:
-        log.warning("watchlist 为空。请在 config.yaml 的 watchlist.tokens 下添加 LFG.RICH 代币")
+        log.warning("Watchlist 为空。请在 config.yaml 的 watchlist.tokens 下添加 LFG.RICH 代币")
         return
 
     kv = KV("state.db")
@@ -120,13 +135,13 @@ def main() -> None:
 
     wallet = (os.environ.get("WALLET_ADDRESS") or "").strip()
     private_key = (os.environ.get("PRIVATE_KEY") or "").strip()
-    trader: TraderLFG | None = None
+    trader = None
 
     if wallet:
         wallet = Web3.to_checksum_address(wallet)
-        log.info("钱包: %s", wallet)
+        log.info("钱包：%s", wallet)
         if not private_key and not cfg.dry_run:
-            raise RuntimeError(".env 中缺少 PRIVATE_KEY（dry_run=false 时必需）")
+            raise RuntimeError("缺少 .env 中的 PRIVATE_KEY（dry_run=false 时必需）")
         trader = TraderLFG(
             w3,
             factory=cfg.lfg_factory,
@@ -138,7 +153,7 @@ def main() -> None:
             slippage_bps=cfg.slippage_bps,
         )
     else:
-        log.warning("未设置 WALLET_ADDRESS。机器人会跟踪价格/信号，但无法交易。")
+        log.warning("未设置 WALLET_ADDRESS。机器人会跟踪价格/信号，但不能交易。")
 
     blocks_per_candle = int(cfg.blocks_per_candle)
     confirmations = int(cfg.confirmations)
@@ -151,7 +166,7 @@ def main() -> None:
     meta_cache: dict[str, dict] = {}
     candle_history: dict[str, list[Candle]] = {}
     log.info(
-        "LFG 扫描器配置: confirmations=%s log_chunk_blocks=%s warmup_lookback_blocks=%s max_history_candles=%s",
+        "LFG 扫描器配置：confirmations=%s log_chunk_blocks=%s warmup_lookback_blocks=%s max_history_candles=%s",
         confirmations,
         chunk_size,
         warmup_lookback_blocks,
@@ -175,7 +190,7 @@ def main() -> None:
         return int(decimals_cache[token_addr])
 
     def _candles_key(token_addr: str) -> str:
-        return f"lfg:candles:{token_addr.lower()}:bpc{blocks_per_candle}"
+        return f"lfg:onchain:candles:{token_addr.lower()}:bpc{blocks_per_candle}"
 
     def save_history(token_addr: str, hist: list[Candle]) -> None:
         trimmed = hist[-max_history_candles:]
@@ -212,24 +227,75 @@ def main() -> None:
         last.low = min(float(last.low), float(spot_price))
         return hist[-max_history_candles:]
 
-    def _get_pool_id(token_addr: str) -> str:
+    def _get_pool_id(token_addr: str, token_cfg=None) -> str:
         token_addr = Web3.to_checksum_address(token_addr)
-        if token_addr not in pool_id_cache:
-            pool_id = with_retries(lambda: lfg.get_pool_id(w3, cfg.lfg_hook, token_addr), cfg.max_retries, cfg.backoff_sec)
-            state = with_retries(lambda: lfg.get_token_state(w3, cfg.lfg_hook, pool_id), cfg.max_retries, cfg.backoff_sec)
-            if not state.get("initialized"):
-                raise RuntimeError(f"代币未在 LFG Hook 注册: {token_addr}")
-            pool_id_cache[token_addr] = pool_id
-            meta_cache[token_addr] = {
-                "pool_id": pool_id,
-                "token_dec": _token_dec(token_addr),
-                "totalFeeBps": int(state.get("totalFeeBps", 0)),
-            }
-            log.info("[%s] LFG pool_id=%s 费用=%sbps", token_addr, pool_id, state.get("totalFeeBps", 0))
+        if token_addr in pool_id_cache:
+            return pool_id_cache[token_addr]
+
+        configured_pool = getattr(token_cfg, "pool_id", "") if token_cfg is not None else ""
+        ctx = with_retries(
+            lambda: lfg.resolve_token_context(
+                w3,
+                token_addr,
+                default_factory=cfg.lfg_factory,
+                default_hook=cfg.lfg_hook,
+                configured_pool_id=configured_pool,
+            ),
+            cfg.max_retries,
+            cfg.backoff_sec,
+        )
+
+        meta = {
+            "context": ctx,
+            "factory": ctx.factory,
+            "hook": ctx.hook,
+            "pool_id": ctx.pool_id,
+            "pool_key": ctx.pool_key,
+            "token_dec": _token_dec(token_addr),
+            "totalFeeBps": int(ctx.state.get("totalFeeBps", 125) or 125),
+            "priceScale": int(ctx.price_scale or lfg.V5_PRICE_SCALE),
+            "protocolVersion": str(ctx.protocol_version or "unknown"),
+            "metadataSource": ctx.metadata_source,
+            "canLiveTrade": bool(ctx.initialized),
+        }
+
+        if not ctx.initialized:
+            log.warning(
+                "[%s] 已解析 poolId=%s factory=%s hook=%s 来源=%s，但 tokenStates(poolId) 尚未初始化/不匹配。在初始化前会跳过真实交易。",
+                token_addr, ctx.pool_id, ctx.factory, ctx.hook, ctx.metadata_source or "链上解析器"
+            )
+
+        pool_id_cache[token_addr] = str(ctx.pool_id)
+        meta_cache[token_addr] = meta
+        if trader:
+            trader.set_token_context(token_addr, context=ctx)
+        log.info(
+            "[%s] LFG 上下文 pool_id=%s factory=%s hook=%s 来源=%s 版本=%s price_scale=%s live_trade=%s",
+            token_addr,
+            ctx.pool_id,
+            ctx.factory,
+            ctx.hook,
+            ctx.metadata_source or "on-chain",
+            meta.get("protocolVersion"),
+            meta.get("priceScale"),
+            meta.get("canLiveTrade"),
+        )
         return pool_id_cache[token_addr]
 
-    def _spot_price(pool_id: str) -> float:
-        return with_retries(lambda: lfg.get_effective_price_bnb_per_token(w3, cfg.lfg_hook, pool_id), cfg.max_retries, cfg.backoff_sec)
+    def _spot_price(pool_id: str, token_addr=None) -> float:
+        if token_addr:
+            token_addr = Web3.to_checksum_address(token_addr)
+            meta = meta_cache.get(token_addr) or {}
+            hook_addr = meta.get("hook") or cfg.lfg_hook
+            price_scale = int(meta.get("priceScale") or lfg.V5_PRICE_SCALE)
+        else:
+            hook_addr = cfg.lfg_hook
+            price_scale = lfg.V5_PRICE_SCALE
+        return with_retries(
+            lambda: lfg.get_effective_price_bnb_per_token(w3, hook_addr, pool_id, price_scale=price_scale),
+            cfg.max_retries,
+            cfg.backoff_sec,
+        )
 
     def _get_gas_cost_wei(tx_hash: str) -> int:
         try:
@@ -297,9 +363,9 @@ def main() -> None:
             delta_bnb=delta_bnb,
             delta_token=delta_token,
             realized_pnl_bnb=realized,
-            note=f"通过 LFG 对账确认已上链（gas={gas_cost_bnb:.8f}）",
+            note=f"通过 LFG reconcile 确认上链 (gas={gas_cost_bnb:.8f})",
         )
-        log.info("[%s] 已上链 %s delta_bnb=%.8f delta_token=%.8f realized=%s", symbol, side, delta_bnb, delta_token, realized)
+        log.info("[%s] 已确认上链 %s delta_bnb=%.8f delta_token=%.8f realized=%s", symbol, side, delta_bnb, delta_token, realized)
         return True
 
     def _reconcile_sent_trades() -> None:
@@ -318,7 +384,7 @@ def main() -> None:
                 continue
             ok = _compute_and_record_mined_trade(tx_hash, token_addr, tr.symbol)
             if not ok:
-                tdb.mark_status_only(tx_hash, "MINED_OK", "mined but no snapshot available")
+                tdb.mark_status_only(tx_hash, "MINED_OK", "已上链，但没有可用快照")
             kv.set_str(f"pending_tx:{token_addr.lower()}", "")
             kv.set_int(f"cooldown_until:{token_addr.lower()}", now_ts + int(cfg.trade_cooldown_sec))
 
@@ -348,7 +414,7 @@ def main() -> None:
                 sold = max(0.0, -delta_token)
                 realized, cost_sold = tdb.consume_lots_fifo(symbol, token_addr, "rebuild", sold, proceeds)
                 tdb.upsert_position(symbol, token_addr, max(0.0, qty - sold), max(0.0, cost - cost_sold))
-        log.info("rebuild_positions_from_trades: 已根据 %d 笔已上链交易重建", len(mined))
+        log.info("rebuild_positions_from_trades：已从 %d 笔已上链交易重建", len(mined))
 
     def sync_positions_from_chain() -> None:
         if not wallet:
@@ -385,21 +451,21 @@ def main() -> None:
             time.sleep(2)
         return False
 
-    # 卖出前的启动授权检查。
+    # 为卖出预热授权。
     if trader and cfg.warmup_approve:
         for t in cfg.watch_tokens:
             try:
                 appr = trader.ensure_allowance_or_approve_max(Web3.to_checksum_address(t.address), 10 ** 30, cfg.dry_run)
                 if appr.action == "APPROVE":
-                    log.info("[%s] 启动授权检查: %s tx=%s note=%s", t.symbol, appr.status, appr.tx_hash, appr.note)
+                    log.info("[%s] 预热授权：%s tx=%s note=%s", t.symbol, appr.status, appr.tx_hash, appr.note)
             except Exception as e:
-                log.warning("[%s] 启动授权检查失败: %s", t.symbol, e)
+                log.warning("[%s] 预热授权失败：%s", t.symbol, e)
 
     try:
         while True:
             latest_block = with_retries(lambda: w3.eth.block_number, cfg.max_retries, cfg.backoff_sec)
             safe_to = max(1, int(latest_block) - confirmations)
-            log.info("调试: latest_block=%s safe_to=%s blocks_per_candle=%s", latest_block, safe_to, blocks_per_candle)
+            log.info("调试：latest_block=%s safe_to=%s blocks_per_candle=%s", latest_block, safe_to, blocks_per_candle)
 
             _reconcile_sent_trades()
             if not did_rebuild_positions:
@@ -409,50 +475,132 @@ def main() -> None:
             for t in cfg.watch_tokens:
                 token = Web3.to_checksum_address(t.address)
                 if str(getattr(t, "dex", "lfg")).lower().strip() not in ("lfg", "v4"):
-                    log.warning("[%s] 当前 LFG 版本不支持 dex=%s；请使用 dex=lfg", t.symbol, t.dex)
+                    log.warning("[%s] 此 LFG 构建不支持 dex=%s；请使用 dex=lfg", t.symbol, t.dex)
                     continue
 
                 try:
                     dec = _token_dec(token)
-                    pool_id = _get_pool_id(token)
+                    pool_id = _get_pool_id(token, t)
                     meta = meta_cache[token]
 
                     if token not in candle_history:
                         candle_history[token] = load_history(token)
                         if candle_history[token]:
-                            log.info("[%s] 已从数据库恢复 LFG K 线: %d", t.symbol, len(candle_history[token]))
+                            log.info("[%s] 已从数据库恢复 LFG K 线：%d", t.symbol, len(candle_history[token]))
+
+                    hist = candle_history.get(token, [])
+                    trades = []
+                    new_from = None
+                    new_to = None
+                    scan_source = "on-chain"
 
                     last_key = f"lfg:last_block:{pool_id}"
                     last = kv.get_int(last_key, default=0)
-                    if last == 0:
-                        last = max(1, safe_to - warmup_lookback_blocks)
+
+                    # 永远不要让旧的 state.db 值强迫扫描器低于
+                    # 配置的 warmup 窗口。对于裁剪历史的 RPC
+                    # 提供商来说这很重要：降低配置中的 warmup_lookback_blocks 必须
+                    # 生效，即使旧运行保存了更旧的区块。
+                    warmup_from = max(1, int(safe_to) - int(warmup_lookback_blocks) + 1)
+                    min_last_for_window = warmup_from - 1
+                    if last <= 0:
+                        last = min_last_for_window
+                    elif last < min_last_for_window:
+                        log.warning(
+                            "[%s] 保存的 last_block=%s 早于配置的 warmup 窗口；限制为 %s 以避免 RPC 历史被裁剪",
+                            t.symbol,
+                            last,
+                            min_last_for_window,
+                        )
+                        last = min_last_for_window
+                        kv.set_int(last_key, last)
 
                     if safe_to <= last:
                         trades = []
-                        new_from = None
-                        new_to = None
                     else:
-                        new_from = last + 1
+                        new_from = max(last + 1, warmup_from)
                         new_to = safe_to
-                        trades = with_retries(
-                            lambda: lfg.fetch_trades(w3, cfg.lfg_hook, pool_id, new_from, new_to, chunk_size=chunk_size),
-                            cfg.max_retries,
-                            cfg.backoff_sec,
-                        )
-                        kv.set_int(last_key, safe_to)
+                        try:
+                            trades = with_retries(
+                                lambda: lfg.fetch_trades(
+                                    w3,
+                                    meta.get("hook") or cfg.lfg_hook,
+                                    pool_id,
+                                    new_from,
+                                    new_to,
+                                    chunk_size=chunk_size,
+                                    price_scale=int(meta.get("priceScale") or lfg.V5_PRICE_SCALE),
+                                ),
+                                cfg.max_retries,
+                                cfg.backoff_sec,
+                            )
+                            kv.set_int(last_key, safe_to)
+                        except Exception as e:
+                            if not is_pruned_history_error(e):
+                                raise
 
-                    new_candles = trades_to_block_candles(trades=trades, blocks_per_candle=blocks_per_candle, token_decimals=dec)
-                    hist = candle_history.get(token, [])
+                            # 针对裁剪历史提供商的最后恢复手段：只尝试
+                            # 最新的区块片段。如果连它也被裁剪，则跳过本轮日志
+                            # 历史扫描，并继续使用当前
+                            # 链上现货价格，避免机器人卡住。
+                            recent_blocks = max(1, min(int(chunk_size), int(warmup_lookback_blocks), 100))
+                            retry_from = max(1, int(safe_to) - recent_blocks + 1)
+                            log.warning(
+                                "[%s] RPC 裁剪了范围 %s-%s 的历史；正在重试最近范围 %s-%s",
+                                t.symbol,
+                                new_from,
+                                new_to,
+                                retry_from,
+                                new_to,
+                            )
+                            try:
+                                trades = with_retries(
+                                    lambda: lfg.fetch_trades(
+                                        w3,
+                                        meta.get("hook") or cfg.lfg_hook,
+                                        pool_id,
+                                        retry_from,
+                                        new_to,
+                                        chunk_size=max(1, min(int(chunk_size), recent_blocks)),
+                                        price_scale=int(meta.get("priceScale") or lfg.V5_PRICE_SCALE),
+                                    ),
+                                    1,
+                                    cfg.backoff_sec,
+                                )
+                                new_from = retry_from
+                                kv.set_int(last_key, safe_to)
+                            except Exception as e2:
+                                if not is_pruned_history_error(e2):
+                                    raise
+                                log.warning(
+                                    "[%s] RPC 连最新 %s 个区块也裁剪了；本轮跳过事件扫描并继续使用现货价格",
+                                    t.symbol,
+                                    recent_blocks,
+                                )
+                                trades = []
+                                # 将游标移动到 safe_to，避免机器人
+                                # 永远重试同一段被裁剪的范围。之后的
+                                # 循环只会扫描新区块。
+                                kv.set_int(last_key, safe_to)
+
+                    new_candles = trades_to_block_candles(
+                        trades=trades,
+                        blocks_per_candle=blocks_per_candle,
+                        token_decimals=dec,
+                        price_scale=int(meta.get("priceScale") or lfg.V5_PRICE_SCALE),
+                    )
                     if new_candles:
                         by_bucket = {c.bucket: c for c in hist}
                         for c in new_candles:
                             by_bucket[c.bucket] = c
                         hist = [by_bucket[k] for k in sorted(by_bucket.keys())][-max_history_candles:]
 
-                    spot = _spot_price(pool_id)
+                    spot = _spot_price(pool_id, token)
                     hist = ensure_flat_candles(hist, spot, safe_to, t)
-                    candle_history[token] = hist
-                    save_history(token, hist)
+
+                    candle_history[token] = hist[-max_history_candles:]
+                    save_history(token, candle_history[token])
+                    hist = candle_history[token]
 
                     if not hist:
                         log.info("[%s] 暂无价格/K 线", t.symbol)
@@ -478,7 +626,7 @@ def main() -> None:
                     real_candles = sum(1 for c in hist if float(getattr(c, "volume_token", 0.0) or 0.0) > 0)
                     price_token_in_wbnb = float(hist[-1].close)
                     if price_token_in_wbnb <= 0:
-                        log.info("[%s] 价格无效", t.symbol)
+                        log.info("[%s] 无效价格", t.symbol)
                         continue
 
                     if (not did_sync_positions_from_chain) and wallet:
@@ -526,7 +674,7 @@ def main() -> None:
                         trade_profit_pct = lot_profit_pct if lot_profit_pct is not None else profit_pct
 
                         log.info(
-                            "[%s] 余额: bnb=%.6f token=%.6f value≈%.6f BNB price=%.12g fee=%sbps",
+                            "[%s] 余额：bnb=%.6f token=%.6f value≈%.6f BNB price=%.12g fee=%sbps",
                             t.symbol,
                             bnb_balance,
                             token_balance,
@@ -542,7 +690,7 @@ def main() -> None:
                                 trade_lot_id = best_lot.get("id")
                                 approx_token_out = qty_to_sell
                                 trade_bnb = qty_to_sell * price_token_in_wbnb
-                                note = f"快速下跌覆盖: lot_id={trade_lot_id} lot_profit={trade_profit_pct:.2f}%"
+                                note = f"快速下跌覆盖：lot_id={trade_lot_id} lot_profit={trade_profit_pct:.2f}%"
 
                         if not force_sell:
                             if cfg.test_mode:
@@ -551,12 +699,12 @@ def main() -> None:
                                     intended = "BUY"
                                     trade_bnb = min(float(cfg.test_amount_bnb), max(0.0, allocatable_bnb))
                                     approx_token_out = trade_bnb / price_token_in_wbnb if price_token_in_wbnb > 0 else 0.0
-                                    note = "TEST_MODE BUY"
+                                    note = "TEST_MODE 买入"
                                 elif action == "SELL":
                                     intended = "SELL"
                                     trade_bnb = min(float(cfg.test_amount_bnb), float(current_alloc_bnb))
                                     approx_token_out = trade_bnb / price_token_in_wbnb if price_token_in_wbnb > 0 else 0.0
-                                    note = "TEST_MODE SELL"
+                                    note = "TEST_MODE 卖出"
                             elif sig.score >= 0.6:
                                 target_alloc = min(float(t.max_alloc_bnb), allocatable_bnb + current_alloc_bnb)
                                 delta = target_alloc - current_alloc_bnb
@@ -565,7 +713,7 @@ def main() -> None:
                                     trade_bnb = clamp(delta, 0.0, min(float(t.add_step_bnb), float(cfg.max_trade_bnb), allocatable_bnb))
                                     if 0 < trade_bnb < float(cfg.min_trade_bnb):
                                         trade_bnb = allocatable_bnb
-                                        note = f"低余额 BUY: spendable={allocatable_bnb:.6f}"
+                                        note = f"低余额买入：可用={allocatable_bnb:.6f}"
                                     approx_token_out = trade_bnb / price_token_in_wbnb if trade_bnb > 0 else 0.0
                             elif sig.score <= -0.6 and current_alloc_bnb > 0 and token_balance > 0:
                                 if best_lot and qty_to_sell > 0:
@@ -573,25 +721,25 @@ def main() -> None:
                                     trade_lot_id = best_lot.get("id")
                                     approx_token_out = qty_to_sell
                                     trade_bnb = qty_to_sell * price_token_in_wbnb
-                                    note = f"SELL LOT lot_id={trade_lot_id} qty≈{approx_token_out:.6f}"
+                                    note = f"卖出 LOT lot_id={trade_lot_id} qty≈{approx_token_out:.6f}"
                                     if trade_profit_pct is not None:
                                         note += f" lot_pnl≈{trade_profit_pct:.2f}%"
                                 elif token_balance > 0:
                                     intended = "SELL"
                                     approx_token_out = token_balance
                                     trade_bnb = current_alloc_bnb
-                                    note = "SELL 钱包余额（没有 open lot）"
+                                    note = "卖出钱包余额（没有开放 lot）"
 
                         if intended == "SELL" and trade_bnb > 0 and not cfg.test_mode:
                             stop_loss = trade_profit_pct is not None and trade_profit_pct <= -float(cfg.max_loss_pct)
                             if cfg.profit_gate_enabled and not stop_loss:
                                 if trade_profit_pct is None or trade_profit_pct < float(cfg.min_profit_pct):
-                                    note = f"卖出被阻止: profit {trade_profit_pct if trade_profit_pct is not None else 'n/a'} < {cfg.min_profit_pct:.2f}%"
+                                    note = f"卖出被阻止：利润 {trade_profit_pct if trade_profit_pct is not None else 'n/a'} < {cfg.min_profit_pct:.2f}%"
                                     intended = "HOLD"
                                     trade_bnb = 0.0
                                     approx_token_out = 0.0
 
-                        range_info = f" range={new_from}-{new_to}" if new_from and new_to else ""
+                        range_info = f" 来源={scan_source} 范围={new_from}-{new_to}" if new_from and new_to else f" 来源={scan_source}"
                         log.info(
                             "[%s] new_events=%d hist=%d real=%d%s | score=%.2f trend=%s rsi=%.2f price=%.12g intended=%s trade_bnb=%.6f note=%s",
                             t.symbol,
@@ -610,16 +758,19 @@ def main() -> None:
 
                         if not trader or intended not in ("BUY", "SELL") or trade_bnb <= 0:
                             continue
+                        if not bool(meta.get("canLiveTrade")):
+                            log.warning("[%s] signal=%s，但已跳过真实交易：token hook 中的 pool 尚未初始化", t.symbol, intended)
+                            continue
 
                         pending_key = f"pending_tx:{token.lower()}"
                         cd_key = f"cooldown_until:{token.lower()}"
                         pending = kv.get_str(pending_key) or ""
                         if pending:
-                            log.info("[%s] 存在 pending tx: %s", t.symbol, pending)
+                            log.info("[%s] 存在待确认 tx：%s", t.symbol, pending)
                             continue
                         cd_until = kv.get_int(cd_key, default=0)
                         if now_ts < cd_until and not cfg.test_mode:
-                            log.info("[%s] 冷却中，剩余 %d 秒", t.symbol, cd_until - now_ts)
+                            log.info("[%s] 冷却中，剩余 %ds", t.symbol, cd_until - now_ts)
                             continue
 
                         bnb_before = int(w3.eth.get_balance(wallet))
@@ -666,17 +817,17 @@ def main() -> None:
                                 kv.set_int(cd_key, now_ts + int(cfg.trade_cooldown_sec))
 
                         if cfg.test_mode and cfg.test_once:
-                            log.info("TEST_MODE 已完成一次执行尝试，正在退出。")
+                            log.info("TEST_MODE 已完成一次执行尝试；退出。")
                             return
 
                 except Exception as e:
-                    log.warning("[%s] 循环错误（将继续运行）: %s", getattr(t, "symbol", "?"), e)
+                    log.warning("[%s] 循环错误（将继续）：%s", getattr(t, "symbol", "?"), e)
                     continue
 
             time.sleep(int(cfg.polling_interval_sec))
 
     except KeyboardInterrupt:
-        log.info("正在正常关闭（Ctrl-C）。")
+        log.info("正在优雅关闭（Ctrl-C）。")
 
 
 if __name__ == "__main__":

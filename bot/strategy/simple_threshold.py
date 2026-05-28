@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Decision:
-    action: str  # "BUY", "SELL", "HOLD"，不要翻译这些值
+    action: str  # "BUY", "SELL", "HOLD"
     reason: str
 
 def decide(price_token_in_wbnb: float, buy_below: float | None, sell_above: float | None) -> Decision:

@@ -22,6 +22,7 @@ class TokenRule:
     rsi_period: int
     dust_size: float
     dex: str = "lfg"
+    pool_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -36,7 +37,6 @@ class AppConfig:
     lfg_hook: str
     lfg_swap_router: str
     lfg_pool_manager: str
-
     polling_interval_sec: int
     trade_cooldown_sec: int
     min_hold_minutes: int
@@ -91,11 +91,11 @@ def load_config(path: str = "config.yaml") -> AppConfig:
 
     rpc_url = os.environ.get("BSC_RPC_URL", "").strip()
     if not rpc_url:
-        raise RuntimeError(".env 中缺少 BSC_RPC_URL")
+        raise RuntimeError("缺少 .env 中的 BSC_RPC_URL")
 
     lfg_raw = raw.get("lfg", {}) or {}
     if not lfg_raw:
-        raise RuntimeError("config.yaml 中缺少 lfg: 配置段")
+        raise RuntimeError("config.yaml 缺少 lfg: section")
 
     watch_tokens: List[TokenRule] = []
     for t in raw.get("watchlist", {}).get("tokens", []):
@@ -111,6 +111,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
                 rsi_period=int(t.get("rsi_period", 14)),
                 dust_size=float(t.get("dust_size", 0.0001)),
                 dex=str(t.get("dex", "lfg")).lower().strip(),
+                pool_id=str(t.get("pool_id") or t.get("poolId") or "").strip(),
             )
         )
 

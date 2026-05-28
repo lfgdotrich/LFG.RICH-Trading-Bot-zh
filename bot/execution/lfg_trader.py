@@ -58,8 +58,8 @@ SWAP_ROUTER_ABI = [
 
 @dataclass
 class ExecResult:
-    status: str               # "DRY_RUN" | "SENT" | "SKIPPED" | "ERROR"，状态值不要翻译
-    action: str               # "BUY" | "SELL" | "APPROVE"，动作值不要翻译
+    status: str               # "DRY_RUN" | "SENT" | "SKIPPED" | "ERROR"
+    action: str               # "BUY" | "SELL" | "APPROVE"
     tx_hash: Optional[str]
     note: str
 
@@ -72,7 +72,7 @@ def _fmt_amount(raw: int, decimals: int, places: int = 6) -> str:
 
 
 class TraderLFG:
-    """LFG.RICH buy/sell execution using the official LFG SwapRouter."""
+    """使用官方 LFG SwapRouter 执行 LFG.RICH 买入/卖出。"""
 
     def __init__(
         self,
@@ -96,8 +96,36 @@ class TraderLFG:
         self.slippage_bps = int(slippage_bps)
         self.router_contract = self.w3.eth.contract(address=self.router, abi=SWAP_ROUTER_ABI)
         self._chain_id: Optional[int] = None
-        self._pool_key_cache: dict[str, tuple[str, str, int, int, str]] = {}
-        self._pool_id_cache: dict[str, str] = {}
+        self._context_cache: dict[str, lfg.TokenContext] = {}
+
+    def set_token_context(self, token: str, context: Optional[lfg.TokenContext] = None, **kwargs) -> None:
+        """注入由 bot.onchain.lfg 解析出的每个代币链上上下文。
+
+        上下文首先来自代币自身：FACTORY()、hook() 和 poolId()。
+        这样可以避免硬编码旧版路由，也避免任何网站依赖。
+        """
+        token = Web3.to_checksum_address(token)
+        if context is not None:
+            self._context_cache[token] = context
+            return
+        # 面向旧调用方/测试的向后兼容路径。
+        pool_id = kwargs.get("pool_id")
+        pool_key = kwargs.get("pool_key")
+        factory = Web3.to_checksum_address(kwargs.get("factory") or self.factory)
+        hook = Web3.to_checksum_address(kwargs.get("hook") or self.hook)
+        if pool_id and pool_key:
+            self._context_cache[token] = lfg.TokenContext(
+                token=token,
+                factory=factory,
+                hook=hook,
+                pool_id=lfg.normalize_pool_id(pool_id),
+                pool_key=pool_key,
+                protocol_version=str(kwargs.get("protocol_version") or "unknown"),
+                price_scale=int(kwargs.get("price_scale") or lfg.V5_PRICE_SCALE),
+                initialized=bool(kwargs.get("initialized", True)),
+                metadata_source="caller-provided",
+                state={},
+            )
 
     def _get_chain_id(self) -> int:
         if self._chain_id is None:
@@ -110,7 +138,7 @@ class TraderLFG:
         if raw is None:
             raw = getattr(signed, "rawTransaction", None)
         if raw is None:
-            raise RuntimeError("SignedTransaction 缺少原始交易字节属性")
+            raise RuntimeError("SignedTransaction 没有原始交易字节属性")
         return self.w3.eth.send_raw_transaction(raw).hex()
 
     def _base_tx_fields(self, nonce: int) -> dict:
@@ -125,27 +153,32 @@ class TraderLFG:
     def _slippage_mult(self) -> float:
         return max(0.0, 1.0 - (self.slippage_bps / 10_000.0))
 
-    def pool_key(self, token: str) -> tuple[str, str, int, int, str]:
+    def context(self, token: str) -> lfg.TokenContext:
         token = Web3.to_checksum_address(token)
-        if token not in self._pool_key_cache:
-            self._pool_key_cache[token] = lfg.get_pool_key(self.w3, self.factory, token)
-        return self._pool_key_cache[token]
+        if token not in self._context_cache:
+            self._context_cache[token] = lfg.resolve_token_context(
+                self.w3,
+                token,
+                default_factory=self.factory,
+                default_hook=self.hook,
+            )
+        return self._context_cache[token]
+
+    def pool_key(self, token: str) -> tuple[str, str, int, int, str]:
+        return self.context(token).pool_key
 
     def pool_id(self, token: str) -> str:
-        token = Web3.to_checksum_address(token)
-        if token not in self._pool_id_cache:
-            self._pool_id_cache[token] = lfg.get_pool_id(self.w3, self.hook, token)
-        return self._pool_id_cache[token]
+        return self.context(token).pool_id
 
     def ensure_allowance_or_approve_max(self, token: str, amount_in_raw: int, dry_run: bool) -> ExecResult:
         token = Web3.to_checksum_address(token)
         current = int(erc20.allowance(self.w3, token, self.wallet, self.router))
         if current >= int(amount_in_raw):
-            return ExecResult("SKIPPED", "APPROVE", None, "allowance ok")
+            return ExecResult("SKIPPED", "APPROVE", None, "allowance 正常")
 
         max_uint = (1 << 256) - 1
         if dry_run:
-            return ExecResult("DRY_RUN", "APPROVE", None, f"将授权 LFG SwapRouter 最大额度（当前={current}）")
+            return ExecResult("DRY_RUN", "APPROVE", None, f"将授权 LFG SwapRouter 最大额度（当前={current})")
 
         try:
             nonce = self.w3.eth.get_transaction_count(self.wallet)
@@ -161,9 +194,9 @@ class TraderLFG:
             )
             tx.setdefault("chainId", self._get_chain_id())
             tx_hash = self._sign_and_send(tx)
-            return ExecResult("SENT", "APPROVE", tx_hash, f"已授权 LFG SwapRouter 最大额度（之前={current}）")
+            return ExecResult("SENT", "APPROVE", tx_hash, f"已授权 LFG SwapRouter 最大额度（之前={current})")
         except Exception as e:
-            return ExecResult("ERROR", "APPROVE", None, f"授权失败: {e}")
+            return ExecResult("ERROR", "APPROVE", None, f"授权失败：{e}")
 
     def buy_token_with_bnb(
         self,
@@ -179,16 +212,19 @@ class TraderLFG:
             return ExecResult("SKIPPED", "BUY", None, "trade_bnb 太小")
 
         try:
-            pool_id = self.pool_id(token)
-            tokens_out, platform_fee, floor_boost_fee = lfg.estimate_buy(self.w3, self.hook, pool_id, amount_in_wei)
+            ctx = self.context(token)
+            pool_id = ctx.pool_id
+            tokens_out, platform_fee, inviter_fee = lfg.estimate_buy(
+                self.w3, ctx.hook, pool_id, amount_in_wei, self.wallet, protocol_version=ctx.protocol_version
+            )
             min_tokens_out = int(tokens_out * self._slippage_mult())
             note = (
                 f"LFG 买入 in={trade_bnb:.6f} BNB "
                 f"min_out≈{_fmt_amount(min_tokens_out, token_decimals)} token "
-                f"platform_fee={platform_fee / 1e18:.8f} floor_boost={floor_boost_fee / 1e18:.8f}"
+                f"fee_platform={platform_fee / 1e18:.8f} inviter_fee={inviter_fee / 1e18:.8f}"
             )
             if min_tokens_out <= 0:
-                return ExecResult("SKIPPED", "BUY", None, f"estimateBuy 返回 0；{note}")
+                return ExecResult("SKIPPED", "BUY", None, f"estimateBuy 返回零；{note}")
             if dry_run:
                 return ExecResult("DRY_RUN", "BUY", None, note)
 
@@ -198,7 +234,7 @@ class TraderLFG:
             tx_hash = self._sign_and_send(tx)
             return ExecResult("SENT", "BUY", tx_hash, note)
         except Exception as e:
-            return ExecResult("ERROR", "BUY", None, f"LFG 买入失败: {e}")
+            return ExecResult("ERROR", "BUY", None, f"LFG 买入失败：{e}")
 
     def sell_token_to_bnb(
         self,
@@ -223,21 +259,24 @@ class TraderLFG:
             amount_in_raw = wallet_bal_raw
             capped = True
         if amount_in_raw <= 0:
-            return ExecResult("SKIPPED", "SELL", None, "amount_in_raw 为 0")
+            return ExecResult("SKIPPED", "SELL", None, "amount_in_raw 为零")
 
         try:
-            pool_id = self.pool_id(token)
-            eth_out, platform_fee, floor_boost_fee = lfg.estimate_sell(self.w3, self.hook, pool_id, amount_in_raw)
+            ctx = self.context(token)
+            pool_id = ctx.pool_id
+            eth_out, platform_fee, inviter_fee = lfg.estimate_sell(
+                self.w3, ctx.hook, pool_id, amount_in_raw, self.wallet, protocol_version=ctx.protocol_version
+            )
             min_eth_out = int(eth_out * self._slippage_mult())
             note = (
                 f"LFG 卖出 in≈{_fmt_amount(amount_in_raw, token_decimals)} token "
                 f"min_out≈{min_eth_out / 1e18:.8f} BNB "
-                f"platform_fee={platform_fee / 1e18:.8f} floor_boost={floor_boost_fee / 1e18:.8f}"
+                f"fee_platform={platform_fee / 1e18:.8f} inviter_fee={inviter_fee / 1e18:.8f}"
             )
             if capped:
                 note += " [已限制为钱包余额]"
             if min_eth_out <= 0:
-                return ExecResult("SKIPPED", "SELL", None, f"estimateSell 返回 0；{note}")
+                return ExecResult("SKIPPED", "SELL", None, f"estimateSell 返回零；{note}")
             if dry_run:
                 return ExecResult("DRY_RUN", "SELL", None, note)
 
@@ -247,7 +286,7 @@ class TraderLFG:
             tx_hash = self._sign_and_send(tx)
             return ExecResult("SENT", "SELL", tx_hash, note)
         except Exception as e:
-            return ExecResult("ERROR", "SELL", None, f"LFG 卖出失败: {e}")
+            return ExecResult("ERROR", "SELL", None, f"LFG 卖出失败：{e}")
 
     def try_get_receipt_status(self, tx_hash_hex: str) -> Optional[int]:
         try:

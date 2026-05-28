@@ -11,20 +11,34 @@ import urllib.request
 
 try:
     from dotenv import load_dotenv
-except Exception:  # dashboard should still load without dotenv
+except Exception:  # 即使没有 dotenv，仪表盘也应该继续加载
     load_dotenv = None
 
 try:
     from web3 import Web3
-except Exception:  # dashboard should still load without web3
+except Exception:  # 即使没有 web3，仪表盘也应该继续加载
     Web3 = None
 
+try:
+    from bot.onchain import lfg as lfg_onchain
+except Exception:
+    lfg_onchain = None
+
 DB_PATH = "state.db"
+LFG_V5_PRICE_SCALE = 10 ** 22
+
+LFG_V3_PRICE_SCALE = 10 ** 18
+
+
+def _price_scale_for_version(version) -> int:
+    v = str(version or "").strip().lower()
+    return LFG_V3_PRICE_SCALE if v in ("v3", "legacy", "legacy_v3") else LFG_V5_PRICE_SCALE
+
 
 def load_dust_map(config_path: str = "config.yaml") -> dict[str, float]:
     """
     从 config.yaml 读取 watchlist.tokens[].dust_size。
-    返回 {symbol: dust_size}。缺少 dust_size 时使用 0.0
+    返回 {symbol: dust_size}。缺少 dust_size -> 0.0
     """
     if not os.path.exists(config_path):
         return {}
@@ -43,7 +57,7 @@ def load_dust_map(config_path: str = "config.yaml") -> dict[str, float]:
                 continue
             out[sym] = float(t.get("dust_size", 0.0))
         except Exception:
-            # 忽略格式错误的配置项
+            # 忽略格式错误的条目
             continue
     return out
 
@@ -71,9 +85,9 @@ def fetch_bnb_usd_from_coingecko(timeout_sec: int = 5) -> float:
 
 def get_bnb_usd_price_cached(ttl_sec: int = 60) -> float:
     """
-    返回缓存的 BNB/USD 价格。最多每 ttl_sec 秒刷新一次。
-    优先尝试 Binance，失败时回退到 CoinGecko。
-    遇到限流或错误时，返回上一次缓存值（如果从未成功过，可能为 0）。
+    返回缓存的 BNB/USD 价格。最多每 ttl_sec 刷新一次。
+    先尝试 Binance，失败则回退到 CoinGecko。
+    如果限速/出错，返回最后缓存的值（如果从未成功过，可能是 0）。
     """
     now = int(time.time())
     if _BNB_USD_CACHE["price"] > 0 and now - int(_BNB_USD_CACHE["ts"]) < ttl_sec:
@@ -112,7 +126,7 @@ def kv_get_str(conn: sqlite3.Connection, key: str) -> str | None:
 
 def fmt_usd_from_bnb(pnl_bnb: float, bnb_price_usd: float) -> str:
     if bnb_price_usd <= 0:
-        return "USD:（价格不可用）"
+        return "USD：（价格不可用）"
     usd = pnl_bnb * bnb_price_usd
     # 避免显示 "-0.00"
     if abs(usd) < 0.005:
@@ -120,7 +134,7 @@ def fmt_usd_from_bnb(pnl_bnb: float, bnb_price_usd: float) -> str:
     return f"${usd:,.2f}"
 
 def load_watch_tokens(config_path: str = "config.yaml") -> list[dict]:
-    """返回 config.yaml 中 watchlist.tokens 的代币配置。"""
+    """从 config.yaml 的 watchlist.tokens 返回代币字典。"""
     if not os.path.exists(config_path):
         return []
     with open(config_path, "r", encoding="utf-8") as f:
@@ -139,8 +153,8 @@ def load_blocks_per_candle(config_path: str = "config.yaml", default: int = 20) 
 
 def kv_get_json(conn: sqlite3.Connection, key: str):
     """
-    Read JSON stored by bot.db_state.KV.
-    Your schema is: kv(k TEXT PRIMARY KEY, v TEXT NOT NULL)
+    读取 bot.db_state.KV 保存的 JSON。
+    schema 为：kv(k TEXT PRIMARY KEY, v TEXT NOT NULL)
     """
     row = conn.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
     if not row or row[0] is None:
@@ -152,9 +166,9 @@ def kv_get_json(conn: sqlite3.Connection, key: str):
 
 def load_last_close_by_symbol(conn: sqlite3.Connection, config_path: str = "config.yaml") -> dict[str, float]:
     """
-    Candle key format used by your bot:
+    机器人使用的 K 线 key 格式：
       candles:{token_addr_lower}:bpc{blocks_per_candle}
-    Returns {symbol: last_close_wbnb_per_token}
+    返回 {symbol: last_close_wbnb_per_token}
     """
     bpc = load_blocks_per_candle(config_path=config_path, default=20)
     out: dict[str, float] = {}
@@ -208,7 +222,7 @@ _LFG_PRICE_CACHE = {"ts": 0, "prices": {}, "errors": []}
 
 
 def _hex0x(value) -> str:
-    """Return a 0x-prefixed hex string for bytes32 values returned by web3.py."""
+    """为 web3.py 返回的 bytes32 值返回带 0x 前缀的十六进制字符串。"""
     if isinstance(value, str):
         v = value.strip()
     elif hasattr(value, "hex"):
@@ -228,7 +242,7 @@ def load_config_raw(config_path: str = "config.yaml") -> dict:
 
 
 def get_rpc_url_from_env() -> str:
-    """Dashboard 使用与机器人相同的 BSC_RPC_URL。"""
+    """仪表盘使用与机器人相同的 BSC_RPC_URL。"""
     if load_dotenv is not None:
         try:
             load_dotenv()
@@ -238,11 +252,11 @@ def get_rpc_url_from_env() -> str:
 
 
 def load_lfg_effective_price_by_symbol(config_path: str = "config.yaml", ttl_sec: int = 30) -> dict[str, float]:
-    """
-    从 LFG Hook 返回 {symbol: 当前 BNB/token 价格}。
+    """Return {symbol: current BNB/token price} from each token's on-chain Hook.
 
-    某些代币可能没有足够的近期 K 线历史。此时 Dashboard 不能把 lots 价格当作 0。
-    对 LFG 代币来说，协议的 getEffectivePrice(poolId) 是正确的备用当前价格。
+    The dashboard uses the same standalone resolver as the bot: token.FACTORY(),
+    token.hook(), token.poolId(), then Factory/Hook fallbacks. It does not query
+    the website for token prices.
     """
     now = int(time.time())
     if _LFG_PRICE_CACHE["prices"] and now - int(_LFG_PRICE_CACHE["ts"]) < ttl_sec:
@@ -251,26 +265,24 @@ def load_lfg_effective_price_by_symbol(config_path: str = "config.yaml", ttl_sec
     prices: dict[str, float] = {}
     errors: list[str] = []
 
-    if Web3 is None:
-        _LFG_PRICE_CACHE.update({"ts": now, "prices": prices, "errors": ["未安装 web3"]})
+    if Web3 is None or lfg_onchain is None:
+        _LFG_PRICE_CACHE.update({"ts": now, "prices": prices, "errors": ["web3 或 bot.onchain.lfg 未安装/无法导入"]})
         return prices
 
     rpc_url = get_rpc_url_from_env()
     if not rpc_url:
-        _LFG_PRICE_CACHE.update({"ts": now, "prices": prices, "errors": [".env 中缺少 BSC_RPC_URL"]})
+        _LFG_PRICE_CACHE.update({"ts": now, "prices": prices, "errors": ["缺少 .env 中的 BSC_RPC_URL"]})
         return prices
 
     raw = load_config_raw(config_path)
-    hook_addr = str(((raw.get("lfg") or {}).get("hook") or "")).strip()
-    if not hook_addr:
-        _LFG_PRICE_CACHE.update({"ts": now, "prices": prices, "errors": ["config.yaml 中缺少 lfg.hook"]})
-        return prices
+    lfg_cfg = raw.get("lfg") or {}
+    default_factory = str(lfg_cfg.get("factory") or "").strip() or None
+    default_hook = str(lfg_cfg.get("hook") or "").strip() or None
 
     try:
         w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
-        hook = w3.eth.contract(address=Web3.to_checksum_address(hook_addr), abi=LFG_HOOK_ABI)
     except Exception as e:
-        _LFG_PRICE_CACHE.update({"ts": now, "prices": prices, "errors": [f"LFG 价格初始化失败: {e}"]})
+        _LFG_PRICE_CACHE.update({"ts": now, "prices": prices, "errors": [f"LFG 价格初始化失败：{e}"]})
         return prices
 
     for t in (raw.get("watchlist", {}) or {}).get("tokens", []) or []:
@@ -280,11 +292,18 @@ def load_lfg_effective_price_by_symbol(config_path: str = "config.yaml", ttl_sec
         if not sym or not addr or dex != "lfg":
             continue
         try:
-            pool_id = _hex0x(hook.functions.tokenToPoolId(Web3.to_checksum_address(addr)).call())
-            raw_price = int(hook.functions.getEffectivePrice(pool_id).call())
-            price = raw_price / 1e18 if raw_price > 0 else 0.0
+            ctx = lfg_onchain.resolve_token_context(
+                w3,
+                Web3.to_checksum_address(addr),
+                default_factory=default_factory,
+                default_hook=default_hook,
+                configured_pool_id=str(t.get("pool_id") or t.get("poolId") or "").strip(),
+            )
+            raw_price = lfg_onchain.get_effective_price_raw(w3, ctx.hook, ctx.pool_id)
+            price = lfg_onchain.raw_price_to_bnb_per_token(raw_price, ctx.price_scale)
             if price > 0:
                 prices[sym] = float(price)
+                continue
         except Exception as e:
             errors.append(f"{sym}: {e}")
             continue
@@ -292,9 +311,8 @@ def load_lfg_effective_price_by_symbol(config_path: str = "config.yaml", ttl_sec
     _LFG_PRICE_CACHE.update({"ts": now, "prices": prices, "errors": errors})
     return prices
 
-
 def load_price_by_symbol(conn: sqlite3.Connection, config_path: str = "config.yaml") -> dict[str, float]:
-    """优先使用 K 线收盘价，然后使用 LFG Hook 有效价格作为备用。"""
+    """先使用 K 线收盘价，然后使用 LFG Hook 有效价格作为回退。"""
     prices = {}
     try:
         prices.update(load_last_close_by_symbol(conn, config_path=config_path))
@@ -304,7 +322,7 @@ def load_price_by_symbol(conn: sqlite3.Connection, config_path: str = "config.ya
     try:
         lfg_prices = load_lfg_effective_price_by_symbol(config_path=config_path)
         for sym, px in lfg_prices.items():
-            # 如果存在真实 K 线收盘价则优先使用；缺失或为 0 时使用 Hook 价格填充。
+            # 如果存在真实 K 线收盘价则优先使用；缺失/为零的价格用 Hook 价格填充。
             if float(prices.get(sym, 0.0) or 0.0) <= 0 and float(px) > 0:
                 prices[sym] = float(px)
     except Exception:
@@ -314,7 +332,7 @@ def load_price_by_symbol(conn: sqlite3.Connection, config_path: str = "config.ya
 
 
 def compute_open_lots_pnl_bnb(conn: sqlite3.Connection, config_path: str = "config.yaml") -> float:
-    """汇总 open FIFO lots 的当前（未实现）PnL，价格来自最新 K 线或 LFG Hook 备用价格。"""
+    """使用最后缓存的 K 线收盘价，汇总开放 FIFO lots 的当前（未实现）PnL。"""
     try:
         lots = pd.read_sql_query(
             """
@@ -330,7 +348,7 @@ def compute_open_lots_pnl_bnb(conn: sqlite3.Connection, config_path: str = "conf
     if lots is None or not len(lots):
         return 0.0
 
-    # 应用每个 symbol 的 dust 过滤器（忽略极小剩余量）
+    # 应用每个 symbol 的 dust 过滤（忽略极小剩余量）
     try:
         lots = lots[
             lots.apply(
@@ -374,8 +392,8 @@ def compute_open_lots_pnl_bnb(conn: sqlite3.Connection, config_path: str = "conf
 
 def get_bnb_price_usd(conn: sqlite3.Connection) -> float:
     """
-    Try to read BNB price in USD from candles table.
-    Looks for common symbol names and returns latest close.
+    尝试从 candles 表读取 BNB 的 USD 价格。
+    查找常见 symbol 名称并返回最新收盘价。
     """
     candidates = [
         "WBNB/USDT",
@@ -384,7 +402,7 @@ def get_bnb_price_usd(conn: sqlite3.Connection) -> float:
         "BNB_USDT",
         "WBNBUSDT",
         "BNBUSDT",
-        "WBNB",   # sometimes dashboards store the quote separately (unlikely)
+        "WBNB",   # 有时仪表盘会单独存储报价资产（可能性较低）
         "BNB",
     ]
 
@@ -411,14 +429,14 @@ def get_bnb_price_usd(conn: sqlite3.Connection) -> float:
     return 0.0
 
 def fmt_usd(x: float) -> str:
-    # 避免显示 "-0.00" caused by floating point tiny negatives
+    # 避免浮点极小负数导致显示 "-0.00"
     if abs(x) < 0.005:
         x = 0.0
     return f"${x:,.2f}"
 
 
-st.set_page_config(page_title="LFG.RICH 交易机器人 PnL", layout="wide")
-st.title("LFG.RICH 交易机器人 – 交易与 PnL")
+st.set_page_config(page_title="bsc-bot PnL", layout="wide")
+st.title("bsc-bot – 交易与 PnL")
 
 conn = sqlite3.connect(DB_PATH)
 
@@ -434,7 +452,7 @@ trades = pd.read_sql_query(
     conn
 )
 
-# 将 Unix 时间戳转换为可读时间
+# 将 Unix 时间戳转换为可读日期时间
 if "ts" in trades.columns:
     trades["ts"] = pd.to_datetime(trades["ts"], unit="s", errors="coerce")
 
@@ -445,16 +463,16 @@ if "tx_hash" in trades.columns:
         lambda x: x if x.startswith("0x") else f"0x{x}" if x != "None" else x
     )
 
-# 仓位
+# 持仓
 pos = pd.read_sql_query(
     "SELECT symbol, token, qty_token, cost_bnb FROM positions ORDER BY symbol",
     conn
 )
 
-st.subheader("概览")
+st.subheader("摘要")
 
 if len(trades) and "realized_pnl_bnb" in trades.columns:
-    # 修复 pandas 未来警告：强制转换为数值并安全处理 NaN
+    # 修复 pandas future warning：强制转为数值并安全处理 NaN
     trades["realized_pnl_bnb"] = pd.to_numeric(trades["realized_pnl_bnb"], errors="coerce")
     realized = trades["realized_pnl_bnb"].fillna(0.0).sum()
 else:
@@ -470,11 +488,11 @@ total_unrealized = float(realized_bnb) + float(open_lots_pnl)
 total_unrealized_usd = float(total_unrealized) * bnb_price_usd
 
 st.caption(
-    f"使用的 BNB 价格: ${bnb_price_usd:,.2f}" if bnb_price_usd > 0 else "使用的 BNB 价格:（不可用）"
+    f"使用的 BNB 价格：${bnb_price_usd:,.2f}" if bnb_price_usd > 0 else "使用的 BNB 价格：（不可用）"
 )
 
-# 每次页面渲染时预热一次 LFG 价格缓存。如果失败，Dashboard 仍会加载，
-# 并只回退到 K 线收盘价。
+# 每次页面渲染时预热一次 LFG 价格缓存。如果失败，仪表盘仍然
+# 会加载，并且只回退到 K 线收盘价。
 try:
     load_lfg_effective_price_by_symbol(config_path="config.yaml")
 except Exception:
@@ -487,7 +505,7 @@ def fmt_inline(bnb: float, usd: float) -> str:
 
     usd_txt = f"${usd:,.2f}"
 
-    # 只给 USD 部分着色
+    # 只给 USD 着色
     if usd > 0:
         usd_html = f"<span style='color:#00a000'>{usd_txt}</span>"
     elif usd < 0:
@@ -522,7 +540,7 @@ def render_pnl_box(title: str, pnl_bnb: float, bnb_price_usd: float) -> None:
     )
 
 
-# 只添加一次（在页面顶部附近，或调用 render_pnl_box 之前）
+# 只添加一次（靠近页面顶部，或在使用 render_pnl_box 前）
 st.markdown(
     """
     <style>
@@ -561,7 +579,7 @@ st.markdown(
 render_pnl_box("总已实现 PnL (BNB)", float(realized), float(bnb_price_usd))
 render_pnl_box("总未实现 PnL (BNB)", float(total_unrealized), float(bnb_price_usd))
 
-st.subheader("开放仓位（成本基础）")
+st.subheader("开放持仓（成本基础）")
 if len(pos):
     pos["qty_token"] = pd.to_numeric(pos["qty_token"], errors="coerce").fillna(0.0)
     pos["cost_bnb"] = pd.to_numeric(pos["cost_bnb"], errors="coerce").fillna(0.0)
@@ -569,22 +587,15 @@ if len(pos):
         lambda r: (r["cost_bnb"] / r["qty_token"]) if r["qty_token"] > 0 else 0.0,
         axis=1,
     )
-    pos_display = pos.rename(columns={
-        "symbol": "代币",
-        "token": "合约地址",
-        "qty_token": "代币数量",
-        "cost_bnb": "成本 BNB",
-        "avg_cost_bnb_per_token": "平均成本 BNB/token",
-    })
-    st.dataframe(pos_display, use_container_width=True)
+    st.dataframe(pos, use_container_width=True)
 else:
-    st.write("暂无开放仓位。")
+    st.write("暂无开放持仓。")
 
 # -----------------------------
 # FIFO Lots + Lot Fills（新增）
 # -----------------------------
 
-st.subheader("开放 Lots（每次 BUY 对应一个 FIFO lot）")
+st.subheader("开放 Lots（每笔 BUY 的 FIFO）")
 
 try:
     lots = pd.read_sql_query(
@@ -601,7 +612,7 @@ try:
     )
 
     if len(lots):
-        # 应用每个 symbol 的 dust 过滤器
+        # 应用每个 symbol 的 dust 过滤
         lots = lots[
             lots.apply(
                 lambda r: float(r["qty_open"]) > float(DUST_BY_SYMBOL.get(str(r["symbol"]), DEFAULT_DUST)),
@@ -610,7 +621,7 @@ try:
         ]
 
     if len(lots):
-        # 将 Unix 时间戳转换为日期时间
+        # 将 Unix ts 转换为日期时间
         if "ts" in lots.columns:
             lots["ts"] = pd.to_datetime(lots["ts"], unit="s", errors="coerce")
 
@@ -624,8 +635,8 @@ try:
         )
 
         # --- 每个 lot 的当前 PnL ---
-        # 优先使用最新缓存 K 线收盘价。如果 LFG 事件/K 线不足，
-        # 回退到 Hook.getEffectivePrice(poolId)，避免 open lots 显示 None PnL。
+        # 优先使用最后缓存的 K 线收盘价。如果 LFG 事件/K 线还不够，
+        # 回退到 Hook.getEffectivePrice(poolId)，避免开放 lots 显示 None PnL。
         try:
             price_by_symbol = load_price_by_symbol(conn, config_path="config.yaml")
         except Exception:
@@ -668,30 +679,16 @@ try:
             ]
         ]
 
-        lots_display = lots_display.rename(columns={
-            "id": "ID",
-            "ts": "时间",
-            "symbol": "代币",
-            "buy_tx": "买入交易",
-            "qty_open": "剩余数量",
-            "cost_open_bnb": "剩余成本 BNB",
-            "avg_entry_wbnb_per_token": "平均入场 BNB/token",
-            "last_close_wbnb_per_token": "当前价格 BNB/token",
-            "value_open_bnb": "当前价值 BNB",
-            "lot_pnl_pct": "Lot PnL %",
-            "qty_init": "初始数量",
-            "cost_init_bnb": "初始成本 BNB",
-        })
         st.dataframe(lots_display, use_container_width=True)
     else:
-        st.write("暂无开放 lots（还没有记录 BUY lot，或全部已经卖出）。")
+        st.write("暂无开放 lots（还没有记录 BUY lots，或已经全部卖出）。")
 
 except Exception as e:
-    st.write("尚未找到 lots 表（运行机器人并创建 FIFO lots 后会出现）。")
+    st.write("尚未找到 lots 表（添加 FIFO lots 后运行机器人）。")
     st.caption(str(e))
 
 
-st.subheader("Lot Fills（SELL 拆分明细）")
+st.subheader("Lot Fills（SELL 明细）")
 
 try:
     fills = pd.read_sql_query(
@@ -716,7 +713,7 @@ try:
     )
 
     if len(fills):
-        # 将 Unix 时间戳转换为日期时间
+        # 将 Unix ts 转换为日期时间
         if "ts" in fills.columns:
             fills["ts"] = pd.to_datetime(fills["ts"], unit="s", errors="coerce")
 
@@ -745,54 +742,30 @@ try:
             ]
         ]
 
-        fills_display = fills_display.rename(columns={
-            "id": "ID",
-            "ts": "时间",
-            "symbol": "代币",
-            "sell_tx": "卖出交易",
-            "lot_id": "Lot ID",
-            "buy_tx": "买入交易",
-            "qty_sold": "卖出数量",
-            "proceeds_bnb": "卖出收入 BNB",
-            "cost_bnb": "成本 BNB",
-            "pnl_bnb": "PnL BNB",
-            "pnl_pct": "PnL %",
-        })
         st.dataframe(fills_display, use_container_width=True)
     else:
         st.write("暂无 lot fills（至少需要一笔已上链 SELL）。")
 
 except Exception as e:
-    st.write("尚未找到 lot_fills 表（运行机器人并创建 FIFO lots 后会出现）。")
+    st.write("尚未找到 lot_fills 表（添加 FIFO lots 后运行机器人）。")
     st.caption(str(e))
 
 
 st.subheader("交易")
 if len(trades):
-    trades_display = trades.rename(columns={
-        "ts": "时间",
-        "symbol": "代币",
-        "side": "方向",
-        "status": "状态",
-        "tx_hash": "交易哈希",
-        "delta_bnb": "BNB 变化",
-        "delta_token": "代币变化",
-        "realized_pnl_bnb": "已实现 PnL BNB",
-        "note": "备注",
-    })
-    st.dataframe(trades_display, use_container_width=True)
+    st.dataframe(trades, use_container_width=True)
 else:
     st.write("暂无交易。")
 
-st.subheader("已实现 PnL 时间走势")
+st.subheader("已实现 PnL 随时间变化")
 if len(trades) and trades["realized_pnl_bnb"].notna().any():
     pnl = trades.dropna(subset=["realized_pnl_bnb"]).copy()
 
-    # ts 以 Unix 秒存储
+    # ts 以 Unix 秒保存
     pnl["ts"] = pd.to_datetime(pnl["ts"], unit="s", errors="coerce")
     pnl = pnl.dropna(subset=["ts"]).sort_values("ts")
 
     pnl["cum_pnl_bnb"] = pnl["realized_pnl_bnb"].cumsum()
     st.line_chart(pnl.set_index("ts")["cum_pnl_bnb"])
 else:
-    st.write("暂无已实现 PnL（至少需要一笔成功的 SELL）。")
+    st.write("暂无已实现 PnL（至少需要一笔成功 SELL）。")
